@@ -128,7 +128,7 @@ class MassEngineClient:
         self.timeout = timeout
 
     def _headers(self, content_type: Optional[str] = "application/json") -> Dict[str, str]:
-        hdrs: Dict[str, str] = {}
+        hdrs: Dict[str, str] = {"User-Agent": "massengine-python/1.1.0"}
         if content_type:
             hdrs["Content-Type"] = content_type
         if self.api_key:
