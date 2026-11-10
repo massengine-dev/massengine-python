@@ -5,7 +5,7 @@ Official zero-dependency Python client for [MassEngine](https://massengine.com) 
 ## Installation
 
 ```bash
-pip install git+https://github.com/massengine-dev/massengine-python.git@v1.1.0
+pip install git+https://github.com/massengine-dev/massengine-python.git@v1.1.2
 ```
 
 ## Quickstart

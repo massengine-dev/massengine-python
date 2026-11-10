@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "massengine"
-version = "1.1.0"
+version = "1.1.2"
 description = "Official Python SDK for the MassEngine vector and hybrid search database."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -29,3 +29,7 @@ dependencies = []
 [project.urls]
 Homepage = "https://massengine.com"
 Repository = "https://github.com/massengine-dev/massengine-python"
+
+[tool.setuptools.packages.find]
+include = ["massengine*"]
+exclude = ["tests*"]
