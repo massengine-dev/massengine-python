@@ -15,4 +15,4 @@ __all__ = [
     "SearchRequest",
     "TenantQuota",
 ]
-__version__ = "1.1.0"
+__version__ = "1.1.2"
