@@ -4,6 +4,7 @@ from .client import (
     MassEngineClient,
     MassEngineError,
     Doc,
+    SDK_VERSION,
     SearchRequest,
     TenantQuota,
 )
@@ -15,4 +16,4 @@ __all__ = [
     "SearchRequest",
     "TenantQuota",
 ]
-__version__ = "1.1.2"
+__version__ = SDK_VERSION
