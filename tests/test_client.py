@@ -123,7 +123,7 @@ class TestMassEngineClient(unittest.TestCase):
     def test_sdk_lifecycle_and_user_agent(self) -> None:
         admin = MassEngineClient(base_url=self.base_url, api_key="  admin-key  ")
         self.assertEqual(admin.health()["status"], "ok")
-        self.assertEqual(_MockGatewayHandler.last_user_agent, "massengine-python/1.1.2")
+        self.assertEqual(_MockGatewayHandler.last_user_agent, "massengine-python/1.1.3")
         self.assertTrue(admin.ready()["ready"])
         self.assertNotIn("admin-key", repr(admin))
 

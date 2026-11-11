@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SDK_VERSION = "1.1.2"
+SDK_VERSION = "1.1.3"
 USER_AGENT = f"massengine-python/{SDK_VERSION}"
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024  # 64 MiB
 MAX_ERROR_RESPONSE_BYTES = 65536               # 64 KiB

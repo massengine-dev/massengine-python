@@ -5,7 +5,7 @@ Official zero-dependency Python client for [MassEngine](https://massengine.com) 
 ## Installation
 
 ```bash
-pip install git+https://github.com/massengine-dev/massengine-python.git@v1.1.2
+pip install massengine
 ```
 
 ## Quickstart
@@ -13,9 +13,10 @@ pip install git+https://github.com/massengine-dev/massengine-python.git@v1.1.2
 ```python
 from massengine import MassEngineClient, Doc
 
+# Connect to a local quickstart cluster (http://localhost:8080) or cloud gateway:
 client = MassEngineClient(
-    base_url="https://api.massengine.com",
-    api_key="mk_your_tenant_api_key",
+    base_url="http://localhost:8080",
+    api_key="mk_your_tenant_or_meadm_admin_key",
 )
 
 # 1. Ingest vectors + structured metadata
