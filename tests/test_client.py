@@ -254,10 +254,10 @@ class TestMassEngineClient(unittest.TestCase):
         _MockGatewayHandler.get_db_405 = False
 
     def test_sdk_lifecycle_and_user_agent(self) -> None:
-        self.assertEqual(massengine.__version__, "1.1.4")
+        self.assertEqual(massengine.__version__, "1.2.0")
         admin = MassEngineClient(base_url=self.base_url, api_key="  admin-key  ")
         self.assertEqual(admin.health()["status"], "ok")
-        self.assertEqual(_MockGatewayHandler.last_user_agent, "massengine-python/1.1.4")
+        self.assertEqual(_MockGatewayHandler.last_user_agent, "massengine-python/1.2.0")
         r_ok = admin.ready()
         self.assertTrue(r_ok["ready"])
         self.assertEqual(r_ok["unavailable_shards"], [])
@@ -316,20 +316,89 @@ class TestMassEngineClient(unittest.TestCase):
             revoked_client.get_doc("acme", "py-1")
         self.assertEqual(ctx.exception.status_code, 401)
 
-    def test_query_text_and_hybrid_alpha_removed_and_empty_vector_rejected(self) -> None:
+    def test_hybrid_lexical_sparse_search_and_validation(self) -> None:
         client = MassEngineClient(base_url=self.base_url, api_key="mk_valid")
-        with self.assertRaises(TypeError):
-            SearchRequest(tenant="acme", vector=[1.0, 0.0], query_text="removed")  # type: ignore[call-arg]
-        with self.assertRaises(TypeError):
-            SearchRequest(tenant="acme", vector=[1.0, 0.0], hybrid_alpha=0.5)  # type: ignore[call-arg]
-        with self.assertRaises(TypeError):
-            client.search("acme", vector=[1.0, 0.0], query_text="removed")  # type: ignore[call-arg]
-        with self.assertRaises(TypeError):
-            client.search("acme", vector=[1.0, 0.0], hybrid_alpha=0.5)  # type: ignore[call-arg]
+        _MockGatewayHandler.recorded_bodies.clear()
 
+        # 1. Ingest with sparse_indices + sparse_values
+        ing = client.ingest(
+            "acme",
+            [
+                Doc(
+                    id="py-hybrid-1",
+                    vector=[1.0, 0.0],
+                    sparse_indices=[10, 42],
+                    sparse_values=[1.5, 0.75],
+                    metadata={"title": "distributed consensus"},
+                )
+            ],
+        )
+        self.assertEqual(ing["ingested"], 1)
+        ing_payload = json.loads(_MockGatewayHandler.recorded_bodies[-1])
+        self.assertEqual(ing_payload["docs"][0]["sparse_indices"], [10, 42])
+        self.assertEqual(ing_payload["docs"][0]["sparse_values"], [1.5, 0.75])
+
+        # 2. Pure BM25 lexical search (vector omitted)
+        sr_bm25 = client.search("acme", query_text="distributed consensus", k=5)
+        self.assertEqual(len(sr_bm25["hits"]), 1)
+        bm25_body = json.loads(_MockGatewayHandler.recorded_bodies[-1])
+        self.assertNotIn("vector", bm25_body)
+        self.assertEqual(bm25_body["query_text"], "distributed consensus")
+
+        # 3. Pure sparse vector search (vector omitted)
+        sr_sparse = client.search("acme", sparse_indices=[10, 42], sparse_values=[1.0, 0.5], k=5)
+        self.assertEqual(len(sr_sparse["hits"]), 1)
+        sparse_body = json.loads(_MockGatewayHandler.recorded_bodies[-1])
+        self.assertNotIn("vector", sparse_body)
+        self.assertEqual(sparse_body["sparse_indices"], [10, 42])
+
+        # 4. Hybrid dense + BM25 + sparse RRF with hybrid_alpha & skip_meta
+        sr_hybrid = client.search(
+            "acme",
+            vector=[1.0, 0.0],
+            query_text="consensus",
+            hybrid_alpha=0.65,
+            sparse_indices=[10],
+            sparse_values=[0.8],
+            skip_meta=True,
+            k=10,
+        )
+        self.assertEqual(len(sr_hybrid["hits"]), 1)
+        hybrid_body = json.loads(_MockGatewayHandler.recorded_bodies[-1])
+        self.assertEqual(hybrid_body["hybrid_alpha"], 0.65)
+        self.assertTrue(hybrid_body["skip_meta"])
+
+        # 5. Batch search with SearchRequest & dict hybrid/BM25/sparse queries
+        bs = client.batch_search(
+            [
+                SearchRequest(tenant="acme", query_text="consensus", k=3),
+                {"tenant": "acme", "sparse_indices": [42], "sparse_values": [1.25], "k": 3},
+            ]
+        )
+        self.assertEqual(len(bs["results"]), 2)
+
+        # 6. Client-side validation rejects empty or malformed queries without contacting server
         before_count = len(_MockGatewayHandler.recorded_paths)
         with self.assertRaises(ValueError):
+            client.search("acme")
+        with self.assertRaises(ValueError):
             client.search("acme", vector=[])
+        with self.assertRaises(ValueError):
+            client.search("acme", query_text="   ")
+        with self.assertRaises(ValueError):
+            client.search("acme", vector=[1.0, 0.0], hybrid_alpha=-0.1)
+        with self.assertRaises(ValueError):
+            client.search("acme", vector=[1.0, 0.0], hybrid_alpha=1.5)
+        with self.assertRaises(ValueError):
+            client.search("acme", vector=[1.0, 0.0], hybrid_alpha=float("nan"))
+        with self.assertRaises(ValueError):
+            client.search("acme", sparse_indices=[1, 2], sparse_values=[0.5])
+        with self.assertRaises(ValueError):
+            client.search("acme", sparse_indices=[-1], sparse_values=[0.5])
+        with self.assertRaises(ValueError):
+            client.search("acme", sparse_indices=[1], sparse_values=[float("inf")])
+        with self.assertRaises(ValueError):
+            client.ingest("acme", [Doc(id="bad", vector=[1.0, 0.0], sparse_indices=[1], sparse_values=[0.5, 0.6])])
         with self.assertRaises(ValueError):
             client.batch_search([])
         with self.assertRaises(ValueError):
