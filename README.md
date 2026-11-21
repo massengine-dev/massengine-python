@@ -1,6 +1,6 @@
 # MassEngine Python SDK (`massengine`)
 
-Official zero-dependency Python client for [MassEngine](https://massengine.com) — the sub-5ms filtered vector search database.
+Official zero-dependency Python client for [MassEngine](https://massengine.com) — the sub-5ms filtered vector and hybrid search database.
 
 ## Installation
 
@@ -46,14 +46,24 @@ res = client.search(
 )
 print(res["hits"])
 
-# 3. In-place metadata patching without re-embedding
+# 3. Hybrid search (dense + BM25 lexical + sparse vectors with weighted RRF)
+hybrid = client.search(
+    "acme-prod",
+    vector=[0.12, -0.44, 0.88, 0.05],
+    query_text="soc2 security policy",
+    hybrid_alpha=0.6,
+    k=10,
+)
+print(hybrid["hits"])
+
+# 4. In-place metadata patching without re-embedding
 client.patch_doc(
     "acme-prod",
     "docs/2026/policy-1",
     metadata={"clearance": 4, "reviewed": True},
 )
 
-# 4. Inspect tenant quota & billable usage
+# 5. Inspect tenant quota & billable usage
 usage = client.get_tenant_usage("acme-prod")
 print(usage)
 ```

@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import ssl
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import urllib.error
 import urllib.parse
 import urllib.request
 
-SDK_VERSION = "1.1.4"
+SDK_VERSION = "1.2.0"
 USER_AGENT = f"massengine-python/{SDK_VERSION}"
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024  # 64 MiB
 MAX_ERROR_RESPONSE_BYTES = 65536               # 64 KiB
 _MAX_LINE_READ_CHUNK = 4 * 1024 * 1024
+_MAX_SPARSE_TERMS = 65536
 
 
 class MassEngineError(Exception):
@@ -64,16 +66,70 @@ def _escape_doc_id(doc_id: str) -> str:
     return "/".join(_validate_segment(part) for part in parts)
 
 
-def _validate_vector(vector: Any) -> List[float]:
+def _validate_finite_float_seq(vector: Any, label: str = "vector") -> List[float]:
     if vector is None or isinstance(vector, (str, bytes, bytearray)):
-        raise ValueError("vector must be a non-empty sequence of numbers")
+        raise ValueError(f"{label} must be a sequence of finite numbers")
     try:
-        vals = list(vector)
+        raw = list(vector)
     except TypeError:
-        raise ValueError("vector must be a non-empty sequence of numbers") from None
+        raise ValueError(f"{label} must be a sequence of finite numbers") from None
+    out: List[float] = []
+    for v in raw:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise ValueError(f"{label} must contain only finite numbers")
+        out.append(float(v))
+    return out
+
+
+def _validate_vector(vector: Any) -> List[float]:
+    vals = _validate_finite_float_seq(vector, "vector")
     if len(vals) == 0:
         raise ValueError("vector must be a non-empty sequence of numbers")
     return vals
+
+
+def _validate_optional_vector(vector: Any) -> List[float]:
+    if vector is None:
+        return []
+    return _validate_finite_float_seq(vector, "vector")
+
+
+def _validate_sparse(
+    sparse_indices: Any,
+    sparse_values: Any,
+) -> Optional[Tuple[List[int], List[float]]]:
+    if sparse_indices is None and sparse_values is None:
+        return None
+    if sparse_indices is None or sparse_values is None:
+        raise ValueError("sparse_indices and sparse_values must both be provided with equal length")
+    if isinstance(sparse_indices, (str, bytes, bytearray)):
+        raise ValueError("sparse_indices must be a sequence of uint32 integers")
+    try:
+        raw_idx = list(sparse_indices)
+    except TypeError:
+        raise ValueError("sparse_indices must be a sequence of uint32 integers") from None
+    vals = _validate_finite_float_seq(sparse_values, "sparse_values")
+    if len(raw_idx) != len(vals):
+        raise ValueError("sparse_indices and sparse_values must have equal length")
+    if len(raw_idx) > _MAX_SPARSE_TERMS:
+        raise ValueError(f"sparse vector exceeds maximum of {_MAX_SPARSE_TERMS} terms")
+    if len(raw_idx) == 0:
+        return None
+    idx_out: List[int] = []
+    for idx in raw_idx:
+        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0 or idx > 0xFFFFFFFF:
+            raise ValueError("sparse_indices must contain integers in [0, 4294967295]")
+        idx_out.append(idx)
+    return idx_out, vals
+
+
+def _validate_hybrid_alpha(alpha: Any) -> float:
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(float(alpha)):
+        raise ValueError("hybrid_alpha must be a finite number between 0.0 and 1.0")
+    val = float(alpha)
+    if val < 0.0 or val > 1.0:
+        raise ValueError("hybrid_alpha must be between 0.0 and 1.0")
+    return val
 
 
 def _extract_error_message(raw_text: str) -> str:
@@ -89,7 +145,7 @@ def _extract_error_message(raw_text: str) -> str:
 
 @dataclass
 class Doc:
-    """Represents a vector document for ingestion or export."""
+    """Represents a document for ingestion or export."""
 
     id: str
     vector: Sequence[float]
@@ -97,13 +153,20 @@ class Doc:
     category: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
     database: Optional[str] = None
+    sparse_indices: Optional[Sequence[int]] = None
+    sparse_values: Optional[Sequence[float]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         _escape_doc_id(self.id)
+        vec = _validate_vector(self.vector)
+        sparse = _validate_sparse(self.sparse_indices, self.sparse_values)
         out: Dict[str, Any] = {
             "id": self.id,
-            "vector": list(self.vector),
+            "vector": vec,
         }
+        if sparse is not None:
+            out["sparse_indices"] = sparse[0]
+            out["sparse_values"] = sparse[1]
         if self.database:
             _validate_identifier(self.database, "database")
             out["database"] = self.database
@@ -118,28 +181,52 @@ class Doc:
 
 @dataclass
 class SearchRequest:
-    """Specifies a single filtered dense vector query."""
+    """Specifies a dense vector, BM25 lexical, sparse vector, or hybrid search query."""
 
     tenant: str = ""
     k: int = 10
-    vector: Sequence[float] = ()
+    vector: Optional[Sequence[float]] = None
+    query_text: Optional[str] = None
+    hybrid_alpha: Optional[float] = None
+    sparse_indices: Optional[Sequence[int]] = None
+    sparse_values: Optional[Sequence[float]] = None
     database: str = ""
     metadata_filter: Optional[Dict[str, Any]] = None
     offset: int = 0
     min_score: Optional[float] = None
     rerank_pool: Optional[int] = None
     nprobe: Optional[int] = None
+    skip_meta: bool = False
     min_date: Optional[int] = None
     max_date: Optional[int] = None
     category: Optional[int] = None
     categories: Optional[Sequence[int]] = None
+    min_doc_id: Optional[int] = None
+    max_doc_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        vec = _validate_vector(self.vector)
+        vec = _validate_optional_vector(self.vector)
+        sparse = _validate_sparse(self.sparse_indices, self.sparse_values)
+        q_text = ""
+        if self.query_text is not None:
+            if not isinstance(self.query_text, str):
+                raise ValueError("query_text must be a string")
+            q_text = self.query_text.strip()
+        if len(vec) == 0 and q_text == "" and sparse is None:
+            raise ValueError("search requires a non-empty vector, query_text, or sparse_indices")
+
         out: Dict[str, Any] = {
-            "vector": vec,
             "k": int(self.k),
         }
+        if len(vec) > 0:
+            out["vector"] = vec
+        if q_text != "":
+            out["query_text"] = self.query_text
+        if self.hybrid_alpha is not None:
+            out["hybrid_alpha"] = _validate_hybrid_alpha(self.hybrid_alpha)
+        if sparse is not None:
+            out["sparse_indices"] = sparse[0]
+            out["sparse_values"] = sparse[1]
         if self.tenant != "":
             _validate_identifier(self.tenant, "tenant")
             out["tenant"] = self.tenant
@@ -156,6 +243,8 @@ class SearchRequest:
             out["rerank_pool"] = int(self.rerank_pool)
         if self.nprobe:
             out["nprobe"] = int(self.nprobe)
+        if self.skip_meta:
+            out["skip_meta"] = True
         if self.min_date is not None:
             out["min_date"] = int(self.min_date)
         if self.max_date is not None:
@@ -164,6 +253,10 @@ class SearchRequest:
             out["category"] = int(self.category)
         if self.categories:
             out["categories"] = [int(c) for c in self.categories]
+        if self.min_doc_id is not None:
+            out["min_doc_id"] = int(self.min_doc_id)
+        if self.max_doc_id is not None:
+            out["max_doc_id"] = int(self.max_doc_id)
         return out
 
 
@@ -355,6 +448,10 @@ class MassEngineClient:
         if not isinstance(d, dict):
             raise ValueError("document must be a Doc or dict")
         cls._esc_doc_id(d.get("id"))  # type: ignore[arg-type]
+        if "vector" in d:
+            _validate_vector(d.get("vector"))
+        if "sparse_indices" in d or "sparse_values" in d:
+            _validate_sparse(d.get("sparse_indices"), d.get("sparse_values"))
         if d.get("database"):
             cls._esc_database(d["database"])
         return d
@@ -380,7 +477,11 @@ class MassEngineClient:
         self,
         tenant: str = "",
         *,
-        vector: Sequence[float],
+        vector: Optional[Sequence[float]] = None,
+        query_text: Optional[str] = None,
+        hybrid_alpha: Optional[float] = None,
+        sparse_indices: Optional[Sequence[int]] = None,
+        sparse_values: Optional[Sequence[float]] = None,
         database: str = "",
         k: int = 10,
         metadata_filter: Optional[Dict[str, Any]] = None,
@@ -388,26 +489,36 @@ class MassEngineClient:
         min_score: Optional[float] = None,
         rerank_pool: Optional[int] = None,
         nprobe: Optional[int] = None,
+        skip_meta: bool = False,
         min_date: Optional[int] = None,
         max_date: Optional[int] = None,
         category: Optional[int] = None,
         categories: Optional[Sequence[int]] = None,
+        min_doc_id: Optional[int] = None,
+        max_doc_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Executes a dense vector search query with optional metadata/date/category filters."""
+        """Executes a dense vector, BM25 lexical, sparse vector, or hybrid search query."""
         sr = SearchRequest(
             tenant=tenant,
             k=k,
             vector=vector,
+            query_text=query_text,
+            hybrid_alpha=hybrid_alpha,
+            sparse_indices=sparse_indices,
+            sparse_values=sparse_values,
             database=database,
             metadata_filter=metadata_filter,
             offset=offset,
             min_score=min_score,
             rerank_pool=rerank_pool,
             nprobe=nprobe,
+            skip_meta=skip_meta,
             min_date=min_date,
             max_date=max_date,
             category=category,
             categories=categories,
+            min_doc_id=min_doc_id,
+            max_doc_id=max_doc_id,
         )
         return self._request_json("POST", "/v1/search", sr.to_dict())
 
@@ -418,7 +529,7 @@ class MassEngineClient:
         tenant: str = "",
         database: str = "",
     ) -> Dict[str, Any]:
-        """Executes multiple dense vector search queries in a single round-trip."""
+        """Executes multiple dense, lexical, sparse, or hybrid search queries in a single round-trip."""
         if not queries:
             raise ValueError("queries must be non-empty")
         esc_tenant = self._validate_optional_tenant(tenant)
@@ -428,9 +539,26 @@ class MassEngineClient:
             if isinstance(q, SearchRequest):
                 serialized.append(q.to_dict())
             elif isinstance(q, dict):
-                vec = _validate_vector(q.get("vector"))
                 q_copy = dict(q)
-                q_copy["vector"] = vec
+                vec = _validate_optional_vector(q_copy.get("vector"))
+                sparse = _validate_sparse(q_copy.get("sparse_indices"), q_copy.get("sparse_values"))
+                q_text_raw = q_copy.get("query_text")
+                q_text = ""
+                if q_text_raw is not None:
+                    if not isinstance(q_text_raw, str):
+                        raise ValueError("query_text must be a string")
+                    q_text = q_text_raw.strip()
+                if len(vec) == 0 and q_text == "" and sparse is None:
+                    raise ValueError("search requires a non-empty vector, query_text, or sparse_indices")
+                if len(vec) > 0:
+                    q_copy["vector"] = vec
+                else:
+                    q_copy.pop("vector", None)
+                if sparse is not None:
+                    q_copy["sparse_indices"] = sparse[0]
+                    q_copy["sparse_values"] = sparse[1]
+                if q_copy.get("hybrid_alpha") is not None:
+                    q_copy["hybrid_alpha"] = _validate_hybrid_alpha(q_copy["hybrid_alpha"])
                 if q_copy.get("tenant"):
                     self._esc_tenant(q_copy["tenant"])
                 if q_copy.get("database"):
