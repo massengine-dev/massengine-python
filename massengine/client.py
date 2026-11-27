@@ -132,6 +132,12 @@ def _validate_hybrid_alpha(alpha: Any) -> float:
     return val
 
 
+def _validate_min_score(val: Any) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+        raise ValueError("min_score must be a finite number")
+    return float(val)
+
+
 def _extract_error_message(raw_text: str) -> str:
     msg = raw_text.strip()
     try:
@@ -238,7 +244,7 @@ class SearchRequest:
         if self.offset:
             out["offset"] = int(self.offset)
         if self.min_score is not None:
-            out["min_score"] = float(self.min_score)
+            out["min_score"] = _validate_min_score(self.min_score)
         if self.rerank_pool:
             out["rerank_pool"] = int(self.rerank_pool)
         if self.nprobe:
@@ -294,7 +300,7 @@ class MassEngineClient:
     ) -> None:
         self.base_url = self._validate_base_url(base_url)
         self._api_key = self._validate_api_key(api_key)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or timeout <= 0:
             raise ValueError("timeout must be a positive number")
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int) or max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be a positive integer")
@@ -380,7 +386,7 @@ class MassEngineClient:
         data: Optional[bytes] = None
         content_type: Optional[str] = None
         if body is not None:
-            data = json.dumps(body).encode("utf-8")
+            data = json.dumps(body, allow_nan=False).encode("utf-8")
             content_type = "application/json"
 
         req = urllib.request.Request(
@@ -559,6 +565,8 @@ class MassEngineClient:
                     q_copy["sparse_values"] = sparse[1]
                 if q_copy.get("hybrid_alpha") is not None:
                     q_copy["hybrid_alpha"] = _validate_hybrid_alpha(q_copy["hybrid_alpha"])
+                if q_copy.get("min_score") is not None:
+                    q_copy["min_score"] = _validate_min_score(q_copy["min_score"])
                 if q_copy.get("tenant"):
                     self._esc_tenant(q_copy["tenant"])
                 if q_copy.get("database"):
@@ -644,7 +652,7 @@ class MassEngineClient:
         esc_tenant = self._validate_optional_tenant(tenant)
         base_path = "/v1/import" if esc_tenant == "" else f"/v1/tenants/{esc_tenant}/import"
         path = self._append_db_query(base_path, database)
-        lines = [json.dumps(self._serialize_doc(d)) for d in docs]
+        lines = [json.dumps(self._serialize_doc(d), allow_nan=False) for d in docs]
         payload = ("\n".join(lines) + "\n").encode("utf-8")
         req = urllib.request.Request(
             url=f"{self.base_url}{path}",
