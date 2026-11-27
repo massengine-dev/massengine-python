@@ -38,6 +38,7 @@ jobs:
           python-version: "3.12"
       - name: Build sdist and wheel
         run: |
+          rm -rf dist
           python3 -m pip install --upgrade build twine
           python3 -m build
           twine check dist/*

@@ -61,6 +61,26 @@ class _MockGatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
         elif p == "/v1/tenants/oversized":
             self._send(200, {"tenant": "oversized", "pad": "x" * 2048})
+        elif p == "/v1/usage":
+            self._send(
+                200,
+                {
+                    "tenants": [{"tenant": "acme", "plan": "pro", "live_docs": 2}],
+                    "total_live_docs": 2,
+                    "total_live_bytes": 4096,
+                    "total_read_units": 4,
+                    "total_write_units": 3,
+                },
+            )
+        elif p == "/v1/tenants":
+            self._send(200, {"tenants": [{"tenant": "acme", "doc_count": 2, "byte_count": 4096}]})
+        elif p.endswith("/quota"):
+            self._send(200, {"tenant": "acme", "quota": {"plan": "pro", "max_docs": 100, "max_bytes": 4096}})
+        elif p == "/v1/tenants/acme":
+            resp_obj = {"tenant": "acme", "doc_count": 2, "byte_count": 4096}
+            if qs.get("database"):
+                resp_obj["database"] = qs["database"][0]
+            self._send(200, resp_obj)
         elif p.endswith("/usage"):
             self._send(200, {"tenant": "acme", "plan": "pro", "live_docs": 2, "read_units": 4, "write_units": 3})
         elif p == "/v1/export" or p.endswith("/export"):
@@ -142,8 +162,12 @@ class _MockGatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if p == "/v1/flush":
-            time.sleep(0.15)
+            if _MockGatewayHandler.recorded_bodies and len(_MockGatewayHandler.recorded_bodies) > 0:
+                pass
+            time.sleep(0.08)
             self._send(200, {"flushed": True})
+        elif p == "/v1/compact":
+            self._send(200, {"compacted": True})
         elif p.endswith("/keys"):
             self._send(200, {"tenant": "acme", "key": "mk_test_key_123"})
         elif p == "/v1/databases" or p.endswith("/databases"):
@@ -523,12 +547,19 @@ class TestMassEngineClient(unittest.TestCase):
             self.assertEqual(dbs[0]["database"], "analytics")
 
             _MockGatewayHandler.get_db_405 = False
+            before_direct = len(_MockGatewayHandler.recorded_paths)
             got_db = client.get_database(tenant, "analytics")
             self.assertEqual(got_db["database"], "analytics")
+            self.assertEqual(len(_MockGatewayHandler.recorded_paths) - before_direct, 1)
 
             _MockGatewayHandler.get_db_405 = True
+            before_fb = len(_MockGatewayHandler.recorded_paths)
             got_fb = client.get_database(tenant, "analytics")
             self.assertEqual(got_fb["database"], "analytics")
+            self.assertEqual(len(_MockGatewayHandler.recorded_paths) - before_fb, 2)
+            with self.assertRaises(MassEngineError) as miss_ctx:
+                client.get_database(tenant, "nonexistent")
+            self.assertEqual(miss_ctx.exception.status_code, 404)
 
             deleted = client.delete_database(tenant, "analytics")
             self.assertEqual(deleted, 2)
@@ -608,9 +639,62 @@ class TestMassEngineClient(unittest.TestCase):
             tiny_export_client.export_tenant("acme")
         self.assertIn("max_response_bytes", str(ctx2.exception))
 
-        fast_client = MassEngineClient(base_url=self.base_url, timeout=0.03)
+        fast_client = MassEngineClient(base_url=self.base_url, timeout=0.02)
         with self.assertRaises((TimeoutError, socket.timeout, OSError)):
             fast_client.flush()
+
+    def test_min_score_nan_timeout_and_strict_json_validation(self) -> None:
+        client = MassEngineClient(base_url=self.base_url, api_key="mk_valid")
+        _MockGatewayHandler.recorded_paths.clear()
+        _MockGatewayHandler.recorded_bodies.clear()
+
+        # Finite min_score (including 0.0 and negative) succeeds
+        self.assertEqual(SearchRequest(vector=[1.0, 0.0], min_score=0.0).to_dict()["min_score"], 0.0)
+        client.search("acme", vector=[1.0, 0.0], min_score=-0.25)
+        self.assertEqual(json.loads(_MockGatewayHandler.recorded_bodies[-1])["min_score"], -0.25)
+        client.batch_search([{"tenant": "acme", "vector": [1.0, 0.0], "min_score": 0.0}])
+
+        before = len(_MockGatewayHandler.recorded_paths)
+        for bad_ms in (float("nan"), float("inf"), float("-inf"), True, "0.5"):
+            with self.assertRaises(ValueError):
+                SearchRequest(vector=[1.0, 0.0], min_score=bad_ms).to_dict()  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                client.search("acme", vector=[1.0, 0.0], min_score=bad_ms)  # type: ignore[arg-type]
+            with self.assertRaises(ValueError):
+                client.batch_search([{"tenant": "acme", "vector": [1.0, 0.0], "min_score": bad_ms}])
+
+        for bad_to in (float("nan"), float("inf"), float("-inf"), -1.0, True):
+            with self.assertRaises(ValueError):
+                MassEngineClient(base_url=self.base_url, timeout=bad_to)  # type: ignore[arg-type]
+
+        # Non-finite float in metadata must be rejected instead of producing invalid NaN JSON
+        with self.assertRaises(ValueError):
+            client.ingest("acme", [Doc(id="nan-meta", vector=[1.0, 0.0], metadata={"bad": float("nan")})])
+        with self.assertRaises(ValueError):
+            client.import_tenant("acme", [Doc(id="inf-meta", vector=[1.0, 0.0], metadata={"bad": float("inf")})])
+        self.assertEqual(len(_MockGatewayHandler.recorded_paths), before)
+
+    def test_admin_and_tenant_management_endpoints(self) -> None:
+        admin = MassEngineClient(base_url=self.base_url, api_key="meadm_test")
+        usage = admin.list_usage()
+        self.assertEqual(usage["total_live_docs"], 2)
+
+        tenants = admin.list_tenants()
+        self.assertEqual(len(tenants), 1)
+        self.assertEqual(tenants[0]["tenant"], "acme")
+
+        t_info = admin.get_tenant("acme", database="analytics")
+        self.assertEqual(t_info["database"], "analytics")
+
+        quota = admin.get_tenant_quota("acme")
+        self.assertEqual(quota["plan"], "pro")
+
+        rev = admin.revoke_tenant_key("acme", "mk_old")
+        self.assertTrue(rev["revoked"])
+
+        self.assertTrue(admin.flush()["flushed"])
+        self.assertTrue(admin.compact()["compacted"])
+        self.assertEqual(admin.delete_tenant("acme"), 2)
 
 
 if __name__ == "__main__":
